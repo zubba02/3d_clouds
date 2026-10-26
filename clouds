@@ -41,6 +41,7 @@ Usage
 """
 
 import argparse
+import warnings
 import bz2
 import datetime as dt
 import os
@@ -52,18 +53,25 @@ import numpy as np
 from scipy import ndimage
 from PIL import Image, ImageDraw, ImageFont
 
+# Harmless noise from satpy/dask: off-disk pixels give NaNs in trig/log maths,
+# and pyproj complains about PROJ-string conversion. Hide it.
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message=".*PROJ string.*")
+np.seterr(all="ignore")
+
 # ---------------------------------------------------------------------------
 # Domain / look
 # ---------------------------------------------------------------------------
-LON_MIN, LON_MAX = 68.5, 78.5
-LAT_MIN, LAT_MAX = -2.5, 9.5
-RES = 0.025                    # deg (~2.8 km) render grid
+LON_MIN, LON_MAX = 67.0, 84.0     # Maldives to Sri Lanka, with room to orbit
+LAT_MIN, LAT_MAX = -5.0, 12.5
+RES = 0.03                     # deg (~3.3 km) render grid
 MVT = dt.timezone(dt.timedelta(hours=5))
 
 T_SURF = 300.0                 # K, tropical sea surface
 LAPSE = 6.5                    # K / km
 Z_SCALE = 0.04                # plot units (deg) per km of cloud height
-WIDTH, HEIGHT = 960, 1200      # output frame size (px)
+WIDTH, HEIGHT = 1080, 1080      # output frame size (px)
+CAM_CENTER = (77.0, 4.4)       # point the camera orbits around (lon, lat)
 
 SEA_RGB = np.array([27, 35, 48])          # dark slate-navy, like the reference
 CITIES = [                                 # (name, lat, lon)
@@ -75,6 +83,12 @@ CITIES = [                                 # (name, lat, lon)
     ("Addu City", -0.629, 73.158),
     ("Minicoy", 8.283, 73.049),
     ("Thiruvananthapuram", 8.524, 76.936),
+    ("Kochi", 9.931, 76.267),
+    ("Kanniyakumari", 8.078, 77.541),
+    ("Colombo", 6.927, 79.861),
+    ("Galle", 6.053, 80.221),
+    ("Jaffna", 9.661, 80.026),
+    ("Trincomalee", 8.587, 81.215),
 ]
 
 ATOLLS = [                                 # subtle labels for the atolls
@@ -91,19 +105,20 @@ ATOLLS = [                                 # subtle labels for the atolls
 # cold end is the rainbow used for deep convection.
 BT_STOPS = [
     (300, SEA_RGB),
-    (291, SEA_RGB),
-    (282, (70, 76, 88)),
-    (265, (128, 133, 142)),
-    (250, (190, 194, 200)),
-    (241, (232, 234, 238)),
-    (236, (70, 120, 235)),     # blue
-    (229, (40, 200, 235)),     # cyan
-    (222, (45, 200, 90)),      # green
-    (214, (250, 220, 40)),     # yellow
-    (206, (250, 140, 30)),     # orange
-    (198, (225, 40, 30)),      # red
-    (188, (150, 10, 25)),      # dark red
-    (175, (110, 0, 60)),       # overshooting tops
+    (290, SEA_RGB),
+    (281, (66, 72, 84)),
+    (265, (122, 127, 136)),
+    (248, (178, 182, 189)),
+    (233, (226, 228, 233)),
+    (226, (245, 246, 248)),    # brightest white just before the colour starts
+    (221, (70, 120, 235)),     # blue
+    (215, (40, 200, 235)),     # cyan
+    (209, (45, 200, 90)),      # green
+    (203, (250, 220, 40)),     # yellow
+    (197, (250, 140, 30)),     # orange
+    (191, (225, 40, 30)),      # red
+    (184, (150, 10, 25)),      # dark red
+    (172, (110, 0, 60)),       # overshooting tops
 ]
 
 
@@ -116,16 +131,22 @@ def bt_to_rgb(bt):
 
 def bt_to_height_km(bt):
     """Cloud-top height from IR temperature; ~0 for clear sky."""
-    h = (T_SURF - np.nan_to_num(bt, nan=T_SURF)) / LAPSE - 1.2
+    h = (T_SURF - np.nan_to_num(bt, nan=T_SURF)) / LAPSE - 1.6
     return np.clip(h, 0, 17)
 
 
 # ---------------------------------------------------------------------------
 # Grid / time helpers
 # ---------------------------------------------------------------------------
+NX = int(round((LON_MAX - LON_MIN) / RES))
+NY = int(round((LAT_MAX - LAT_MIN) / RES))
+
+
 def grid_lonlat():
-    lons = np.arange(LON_MIN + RES / 2, LON_MAX, RES)
-    lats = np.arange(LAT_MAX - RES / 2, LAT_MIN, -RES)        # north -> south
+    """Pixel-centre lon/lat of the render grid - exactly matches target_area()."""
+    dx, dy = (LON_MAX - LON_MIN) / NX, (LAT_MAX - LAT_MIN) / NY
+    lons = LON_MIN + dx * (np.arange(NX) + 0.5)
+    lats = LAT_MAX - dy * (np.arange(NY) + 0.5)               # north -> south
     return np.meshgrid(lons, lats)
 
 
@@ -133,7 +154,7 @@ def target_area():
     from pyresample import create_area_def
     return create_area_def("maldives", "EPSG:4326",
                            area_extent=(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX),
-                           resolution=RES, units="degrees")
+                           shape=(NY, NX), units="degrees")
 
 
 def frame_times(local_date, step_min):
@@ -197,7 +218,7 @@ def coastlines(cache=f"coast_cache_{LON_MIN}_{LON_MAX}_{LAT_MIN}_{LAT_MAX}.npz")
 # Source 1: Himawari-9 (AWS, anonymous)
 # ---------------------------------------------------------------------------
 HIMAWARI_BUCKET = "noaa-himawari9"
-HIMAWARI_SEGMENTS = (5, 6)          # full-disk segments covering ~3°S-10°N at 73°E
+HIMAWARI_SEGMENTS = (4, 5, 6)       # full-disk segments covering ~10°S-20°N at 67-84°E
 
 
 def himawari_fetch(t_utc, cache):
@@ -295,13 +316,13 @@ def demo_bt_series(times, seed=3):
     ny, nx = lon.shape
     nt = len(times)
     # evolving texture fields (time, y, x), generated at half resolution
-    tex = _spectral_noise((nt, ny // 2, nx // 2), 3.2, rng)
-    fine = _spectral_noise((nt, ny // 2, nx // 2), 2.2, rng)
+    tex = _spectral_noise((nt, (ny + 1) // 2, (nx + 1) // 2), 3.2, rng)
+    fine = _spectral_noise((nt, (ny + 1) // 2, (nx + 1) // 2), 2.2, rng)
     tex = ndimage.zoom(tex, (1, 2, 2), order=1)[:, :ny, :nx]
     fine = ndimage.zoom(fine, (1, 2, 2), order=1)[:, :ny, :nx]
     # convective systems drifting west with a morning peak over the ocean
     systems = []
-    for _ in range(14):
+    for _ in range(24):
         systems.append(dict(x=rng.uniform(LON_MIN, LON_MAX + 2),
                             y=rng.uniform(LAT_MIN, LAT_MAX),
                             u=rng.normal(-0.05, 0.02), v=rng.normal(0.0, 0.015),
@@ -334,7 +355,8 @@ def demo_bt_series(times, seed=3):
 # 3-D rendering with PyVista
 # ---------------------------------------------------------------------------
 class Renderer:
-    def __init__(self, segs):
+    def __init__(self, segs, elev=62, orbit=32, dist=27):
+        self.elev, self.orbit, self.dist = elev, orbit, dist
         import pyvista as pv
         self.pv = pv
         pv.OFF_SCREEN = True
@@ -342,7 +364,7 @@ class Renderer:
         self.lon, self.lat = lon, lat
         self.p = pv.Plotter(off_screen=True, window_size=(WIDTH, HEIGHT),
                             lighting="none")
-        self.p.set_background(SEA_RGB / 255 * 0.8)
+        self.p.set_background(SEA_RGB / 255 * 1.08)   # blends with the lit sea
         self.p.enable_anti_aliasing("msaa", multi_samples=8)
 
         # cloud / sea surface (one mesh, heights updated per frame)
@@ -366,13 +388,15 @@ class Renderer:
         self.p.camera.SetViewAngle(30)
 
     def set_camera(self, k, n):
-        """Viewed from the south, tilted ~55°, with a slow swing across the day."""
-        cx, cy = 73.6, 3.0
-        swing = np.sin(2 * np.pi * k / n)
-        dist, elev = 17.5, np.radians(47 + 3 * np.cos(2 * np.pi * k / n))
-        self.cam_pos = np.array([cx - 1.0 * swing, cy - dist * np.cos(elev),
-                                 dist * np.sin(elev)])
+        """Look down at ELEV degrees and orbit back and forth through ORBIT degrees."""
+        cx, cy = CAM_CENTER
+        az = np.radians(0.5 * self.orbit * np.sin(2 * np.pi * k / n))
+        el = np.radians(self.elev)
+        self.cam_pos = np.array([cx + self.dist * np.cos(el) * np.sin(az),
+                                 cy - self.dist * np.cos(el) * np.cos(az),
+                                 self.dist * np.sin(el)])
         self.p.camera_position = [tuple(self.cam_pos), (cx, cy, 0.0), (0, 0, 1)]
+        self.p.reset_camera_clipping_range()
 
     def project(self, pts):
         """World -> pixel coordinates (top-left origin) for the current view."""
@@ -397,7 +421,12 @@ class Renderer:
         return bool(np.any(zs > ray[:, 2]))
 
     def frame(self, bt, k, n):
-        bt = ndimage.gaussian_filter(np.nan_to_num(bt, nan=T_SURF), 1.1)
+        bt = np.nan_to_num(np.asarray(bt, float), nan=T_SURF)
+        if bt.shape != self.lon.shape:          # safety net: never crash on a 1-px mismatch
+            bt = ndimage.zoom(bt, (self.lon.shape[0] / bt.shape[0],
+                                   self.lon.shape[1] / bt.shape[1]), order=1)
+            bt = bt[:self.lon.shape[0], :self.lon.shape[1]]
+        bt = ndimage.gaussian_filter(bt, 1.1)
         z = bt_to_height_km(bt) * Z_SCALE
         grid = self.pv.StructuredGrid(self.lon, self.lat, z)
         grid["rgb"] = bt_to_rgb(bt).reshape(-1, 3, order="F")
@@ -423,17 +452,34 @@ class Renderer:
 # ---------------------------------------------------------------------------
 # 2-D overlay (title, time, legend, credits)
 # ---------------------------------------------------------------------------
+_FONT_CACHE = {}
+
+
 def _font(size, bold=False, mono=False):
-    names = (["DejaVuSansMono-Bold.ttf", "DejaVuSansMono.ttf"] if mono else
-             ["DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"])
-    for nm in names:
-        for d in ("/usr/share/fonts/truetype/dejavu", "/Library/Fonts",
-                  "C:/Windows/Fonts", ""):
+    """DejaVu fonts bundled with matplotlib (same on Windows/Mac/Linux)."""
+    key = (size, bold, mono)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    name = ("DejaVuSansMono" if mono else "DejaVuSans") + ("-Bold" if bold or mono else "")
+    dirs = []
+    try:
+        import matplotlib
+        dirs.append(os.path.join(matplotlib.get_data_path(), "fonts", "ttf"))
+    except ImportError:
+        pass
+    dirs += ["/usr/share/fonts/truetype/dejavu", "C:/Windows/Fonts", "/Library/Fonts", ""]
+    fallbacks = [name + ".ttf", "arialbd.ttf" if bold else "arial.ttf", "segoeui.ttf"]
+    for nm in fallbacks:
+        for d in dirs:
             try:
-                return ImageFont.truetype(os.path.join(d, nm), size)
+                f = ImageFont.truetype(os.path.join(d, nm), size)
+                _FONT_CACHE[key] = f
+                return f
             except OSError:
                 pass
-    return ImageFont.load_default()
+    f = ImageFont.load_default(size)
+    _FONT_CACHE[key] = f
+    return f
 
 
 def overlay(img, labels, t_utc, k, n, bt, credit, demo):
@@ -460,7 +506,7 @@ def overlay(img, labels, t_utc, k, n, bt, credit, demo):
     for y in range(170):
         d.line([(0, y), (W, y)], fill=(12, 16, 24, int(200 * (1 - y / 170))))
     t_loc = t_utc.astimezone(MVT)
-    d.text((28, 22), "MALDIVES  ·  3D SATELLITE CLOUDS", font=_font(26, True),
+    d.text((28, 22), "MALDIVES & SRI LANKA  ·  3D SATELLITE CLOUDS", font=_font(26, True),
            fill=(255, 255, 255, 255))
     d.text((28, 60), f"{t_loc:%d %b %Y   %H:%M} MVT", font=_font(30, mono=True),
            fill=(255, 214, 64, 255))
@@ -472,7 +518,7 @@ def overlay(img, labels, t_utc, k, n, bt, credit, demo):
                         fill=(255, 214, 64, 230))
 
     # deep-convection readout
-    deep = np.mean(np.nan_to_num(bt, nan=300) < 220) * 100
+    deep = np.mean(np.nan_to_num(bt, nan=300) < 210) * 100
     d.text((W - 28, 100), f"deep convection {deep:4.1f}%", font=_font(16, True),
            fill=(255, 120, 90, 255) if deep > 1 else (200, 208, 222, 200),
            anchor="ra")
@@ -486,8 +532,8 @@ def overlay(img, labels, t_utc, k, n, bt, credit, demo):
     for i, c in enumerate(cols):
         d.line([(x0 + i, yb), (x0 + i, yb + 12)], fill=tuple(int(v) for v in c) + (255,))
     d.rectangle([x0, yb, x1, yb + 12], outline=(255, 255, 255, 120))
-    for tk, lbl in [(280, "low"), (250, "mid"), (230, "−43°C"),
-                    (210, "−63°C"), (190, "−83°C")]:
+    for tk, lbl in [(280, "low"), (250, "mid"), (221, "−52°C"),
+                    (203, "−70°C"), (186, "−87°C")]:
         xi = x0 + (290 - tk) / 105 * (x1 - x0)
         d.text((xi, yb + 18), lbl, font=_font(13), fill=(220, 226, 236, 230), anchor="ma")
     d.text((W / 2, yb - 26), "cloud-top temperature  —  red = intense thunderstorms",
@@ -542,13 +588,20 @@ def main():
                     help="Maldives local date YYYY-MM-DD (default: yesterday)")
     ap.add_argument("--source", choices=["himawari", "meteosat"], default="himawari")
     ap.add_argument("--step", type=int, default=20, help="minutes between frames")
-    ap.add_argument("--fps", type=float, default=10)
+    ap.add_argument("--fps", type=float, default=12)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--cache", default="sat_cache")
     ap.add_argument("--out", default=None, help="output .gif path")
     ap.add_argument("--no-mp4", action="store_true")
     ap.add_argument("--gif-width", type=int, default=560,
                     help="GIF width in px (MP4 keeps full size)")
+    ap.add_argument("--interp", type=int, default=2,
+                    help="smooth motion: N-1 blended frames between satellite frames")
+    ap.add_argument("--elev", type=float, default=62,
+                    help="camera tilt in degrees (90 = straight down)")
+    ap.add_argument("--orbit", type=float, default=32,
+                    help="total degrees the camera swings around (0 = fixed)")
+    ap.add_argument("--zoom", type=float, default=1.0, help=">1 zooms in")
     ap.add_argument("--demo", action="store_true")
     args = ap.parse_args()
 
@@ -560,7 +613,17 @@ def main():
     if not pairs:
         sys.exit("No usable imagery.")
 
-    r = Renderer(coastlines())
+    # temporal interpolation for smoother motion
+    if args.interp > 1 and len(pairs) > 1:
+        smooth = []
+        for (t0, b0), (t1, b1) in zip(pairs[:-1], pairs[1:]):
+            for j in range(args.interp):
+                w = j / args.interp
+                smooth.append((t0 + (t1 - t0) * w, (1 - w) * b0 + w * b1))
+        smooth.append(pairs[-1])
+        pairs = smooth
+
+    r = Renderer(coastlines(), elev=args.elev, orbit=args.orbit, dist=27 / args.zoom)
     frames = []
     for k, (t, bt) in enumerate(pairs):
         img, labels = r.frame(bt, k, len(pairs))
@@ -568,12 +631,6 @@ def main():
         print(f"  rendered {k + 1}/{len(pairs)}", end="\r")
     print()
 
-    import imageio.v2 as imageio
-    if not args.no_mp4:
-        mp4 = os.path.splitext(out)[0] + ".mp4"
-        imageio.mimsave(mp4, frames, fps=args.fps, codec="libx264", quality=8,
-                        macro_block_size=8)
-        print("Saved", mp4)
     gh = int(HEIGHT * args.gif_width / WIDTH)
     small = [Image.fromarray(f).resize((args.gif_width, gh), Image.LANCZOS)
              for f in frames]
@@ -593,6 +650,20 @@ def main():
     gif[0].save(out, save_all=True, append_images=gif[1:], duration=durs,
                 loop=0, optimize=False)
     print("Saved", out)
+
+    # MP4 is optional (needs `pip install imageio-ffmpeg`); the GIF is already safe
+    if not args.no_mp4:
+        mp4 = os.path.splitext(out)[0] + ".mp4"
+        try:
+            import imageio.v2 as imageio
+            imageio.mimsave(mp4, frames, fps=args.fps, codec="libx264", quality=8,
+                            macro_block_size=8)
+            print("Saved", mp4)
+        except Exception as e:
+            if os.path.exists(mp4):
+                os.remove(mp4)                      # don't leave a broken file
+            print(f"MP4 skipped ({type(e).__name__}). For video output run:"
+                  "  pip install imageio-ffmpeg")
 
 
 if __name__ == "__main__":
