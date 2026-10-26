@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+maldives_clouds_3d.py  —  3-D satellite cloud animation over the Maldives
+==========================================================================
+Downloads one local day of geostationary infrared (IR) imagery and renders a
+lit, perspective 3-D "cloud-top terrain" animation:
+
+  * cloud-top height is estimated from IR brightness temperature (BT);
+    colder tops = taller clouds, so the surface rises with convection
+  * ordinary clouds are shaded grey; the coldest, deepest convective tops use
+    an enhanced-IR rainbow (blue > cyan > green > yellow > orange > red), so
+    big thunderstorm complexes glow red
+  * dark sea, thin white GSHHS full-resolution coastlines (every island the
+    dataset holds), and city labels for the main Maldives towns
+  * output: animated GIF (and MP4)
+
+Data sources
+------------
+  himawari  (default, no account)  Himawari-9 AHI band 13 (10.4 µm), NOAA Open
+            Data bucket on AWS. The Maldives sits near the western edge of the
+            disk, so pixels are ~5-6 km; still good for convective systems.
+  meteosat  Meteosat IODC SEVIRI IR_108 from the EUMETSAT Data Store. Better
+            viewing angle; needs a free API key in EUMETSAT_KEY/EUMETSAT_SECRET
+            (https://api.eumetsat.int/api-key).
+
+Install
+-------
+  pip install satpy pyresample s3fs eumdac pyvista numpy scipy pillow \
+              imageio imageio-ffmpeg basemap-data-hires
+
+  On a headless Linux server PyVista needs off-screen rendering
+  (it usually works out of the box; otherwise `pip install vtk-osmesa`
+  or run under `xvfb-run`).
+
+Usage
+-----
+  python maldives_clouds_3d.py                         # yesterday, Himawari
+  python maldives_clouds_3d.py --date 2026-10-25 --step 10
+  python maldives_clouds_3d.py --source meteosat
+  python maldives_clouds_3d.py --demo                  # synthetic, no download
+"""
+
+import argparse
+import bz2
+import datetime as dt
+import os
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+from scipy import ndimage
+from PIL import Image, ImageDraw, ImageFont
+
+# ---------------------------------------------------------------------------
+# Domain / look
+# ---------------------------------------------------------------------------
+LON_MIN, LON_MAX = 68.5, 78.5
+LAT_MIN, LAT_MAX = -2.5, 9.5
+RES = 0.025                    # deg (~2.8 km) render grid
+MVT = dt.timezone(dt.timedelta(hours=5))
+
+T_SURF = 300.0                 # K, tropical sea surface
+LAPSE = 6.5                    # K / km
+Z_SCALE = 0.04                # plot units (deg) per km of cloud height
+WIDTH, HEIGHT = 960, 1200      # output frame size (px)
+
+SEA_RGB = np.array([27, 35, 48])          # dark slate-navy, like the reference
+CITIES = [                                 # (name, lat, lon)
+    ("Malé", 4.175, 73.509),
+    ("Kulhudhuffushi", 6.622, 73.070),
+    ("Fonadhoo", 1.833, 73.502),
+    ("Thinadhoo", 0.530, 72.996),
+    ("Fuvahmulah", -0.299, 73.424),
+    ("Addu City", -0.629, 73.158),
+    ("Minicoy", 8.283, 73.049),
+    ("Thiruvananthapuram", 8.524, 76.936),
+]
+
+ATOLLS = [                                 # subtle labels for the atolls
+    ("Haa Alifu", 6.95, 72.95), ("Haa Dhaalu", 6.60, 73.05),
+    ("Shaviyani", 6.25, 73.20), ("Noonu", 5.85, 73.35), ("Raa", 5.60, 72.95),
+    ("Lhaviyani", 5.35, 73.55), ("Baa", 5.15, 73.00), ("Kaafu", 4.45, 73.45),
+    ("Alifu Alifu", 4.10, 72.85), ("Alifu Dhaalu", 3.62, 72.80),
+    ("Vaavu", 3.45, 73.50), ("Faafu", 3.18, 72.95), ("Meemu", 2.95, 73.55),
+    ("Dhaalu", 2.85, 72.92), ("Thaa", 2.35, 73.08), ("Laamu", 1.90, 73.40),
+    ("Gaafu Alifu", 0.75, 73.35), ("Gaafu Dhaalu", 0.35, 73.10),
+]
+
+# Enhanced-IR palette: (BT kelvin, RGB). Warm end blends sea -> grey -> white,
+# cold end is the rainbow used for deep convection.
+BT_STOPS = [
+    (300, SEA_RGB),
+    (291, SEA_RGB),
+    (282, (70, 76, 88)),
+    (265, (128, 133, 142)),
+    (250, (190, 194, 200)),
+    (241, (232, 234, 238)),
+    (236, (70, 120, 235)),     # blue
+    (229, (40, 200, 235)),     # cyan
+    (222, (45, 200, 90)),      # green
+    (214, (250, 220, 40)),     # yellow
+    (206, (250, 140, 30)),     # orange
+    (198, (225, 40, 30)),      # red
+    (188, (150, 10, 25)),      # dark red
+    (175, (110, 0, 60)),       # overshooting tops
+]
+
+
+def bt_to_rgb(bt):
+    t = np.array([s[0] for s in BT_STOPS], float)[::-1]
+    c = np.array([s[1] for s in BT_STOPS], float)[::-1]
+    b = np.clip(np.nan_to_num(bt, nan=300.0), t[0], t[-1])
+    return np.stack([np.interp(b, t, c[:, i]) for i in range(3)], -1).astype(np.uint8)
+
+
+def bt_to_height_km(bt):
+    """Cloud-top height from IR temperature; ~0 for clear sky."""
+    h = (T_SURF - np.nan_to_num(bt, nan=T_SURF)) / LAPSE - 1.2
+    return np.clip(h, 0, 17)
+
+
+# ---------------------------------------------------------------------------
+# Grid / time helpers
+# ---------------------------------------------------------------------------
+def grid_lonlat():
+    lons = np.arange(LON_MIN + RES / 2, LON_MAX, RES)
+    lats = np.arange(LAT_MAX - RES / 2, LAT_MIN, -RES)        # north -> south
+    return np.meshgrid(lons, lats)
+
+
+def target_area():
+    from pyresample import create_area_def
+    return create_area_def("maldives", "EPSG:4326",
+                           area_extent=(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX),
+                           resolution=RES, units="degrees")
+
+
+def frame_times(local_date, step_min):
+    start = dt.datetime.combine(local_date, dt.time(0, 0), tzinfo=MVT)
+    return [(start + dt.timedelta(minutes=i * step_min)).astimezone(dt.timezone.utc)
+            for i in range(24 * 60 // step_min)]
+
+
+# ---------------------------------------------------------------------------
+# Coastlines (GSHHS full resolution, cached after first use)
+# ---------------------------------------------------------------------------
+def coastlines(cache=f"coast_cache_{LON_MIN}_{LON_MAX}_{LAT_MIN}_{LAT_MAX}.npz"):
+    if os.path.exists(cache):
+        d = np.load(cache, allow_pickle=True)
+        return list(d["segs"])
+    # GSHHS full-resolution data from the pure-data package `basemap-data-hires`
+    # (read directly - the `basemap` library itself is NOT needed).
+    import importlib.util
+    spec = importlib.util.find_spec("mpl_toolkits.basemap_data")
+    if spec is None or not spec.submodule_search_locations:
+        print("WARNING: coastline data not found - run `pip install basemap-data-hires`."
+              " Continuing without coastlines.")
+        return []
+    ddir = list(spec.submodule_search_locations)[0]
+    meta = os.path.join(ddir, "gshhsmeta_f.dat")
+    data = os.path.join(ddir, "gshhs_f.dat")
+    if not (os.path.exists(meta) and os.path.exists(data)):
+        print("WARNING: gshhs_f.dat missing - run `pip install basemap-data-hires`.")
+        return []
+
+    print("Extracting full-resolution coastlines (one-off)...")
+    segs = []
+    with open(meta) as fm, open(data, "rb") as fd:
+        for line in fm:
+            f = line.split()
+            south, north = float(f[3]), float(f[4])
+            if north < LAT_MIN or south > LAT_MAX:
+                continue
+            npts, offset, nbytes = int(f[2]), int(f[5]), int(f[6])
+            fd.seek(offset)
+            xy = np.frombuffer(fd.read(nbytes), dtype="<f4").astype(float)
+            xy = xy.reshape(npts, 2)                       # columns: lon, lat
+            xy[:, 0] = np.where(xy[:, 0] > 180, xy[:, 0] - 360, xy[:, 0])
+            inside = ((xy[:, 0] >= LON_MIN) & (xy[:, 0] <= LON_MAX) &
+                      (xy[:, 1] >= LAT_MIN) & (xy[:, 1] <= LAT_MAX))
+            if not inside.any():
+                continue
+            # split into runs of consecutive in-domain points
+            edges = np.flatnonzero(np.diff(np.r_[0, inside.astype(int), 0]))
+            for a, b in zip(edges[::2], edges[1::2]):
+                if b - a > 1:
+                    segs.append(xy[a:b])
+            if inside.all() and len(xy) > 2:                # close islands
+                segs[-1] = np.vstack([segs[-1], segs[-1][:1]])
+    np.savez(cache, segs=np.array(segs, dtype=object))
+    print(f"  {len(segs)} coastline segments")
+    return segs
+
+
+# ---------------------------------------------------------------------------
+# Source 1: Himawari-9 (AWS, anonymous)
+# ---------------------------------------------------------------------------
+HIMAWARI_BUCKET = "noaa-himawari9"
+HIMAWARI_SEGMENTS = (5, 6)          # full-disk segments covering ~3°S-10°N at 73°E
+
+
+def himawari_fetch(t_utc, cache):
+    import s3fs
+    fs = s3fs.S3FileSystem(anon=True)
+    t = t_utc.replace(minute=t_utc.minute - t_utc.minute % 10, second=0)
+    prefix = f"{HIMAWARI_BUCKET}/AHI-L1b-FLDK/{t:%Y/%m/%d/%H%M}/"
+    out = []
+    for seg in HIMAWARI_SEGMENTS:
+        name = f"HS_H09_{t:%Y%m%d_%H%M}_B13_FLDK_R20_S{seg:02d}10.DAT"
+        local = os.path.join(cache, name)
+        if not os.path.exists(local):
+            try:
+                with fs.open(prefix + name + ".bz2", "rb") as src, \
+                        open(local + ".part", "wb") as dst:
+                    dst.write(bz2.decompress(src.read()))
+                os.replace(local + ".part", local)
+            except FileNotFoundError:
+                return None
+        out.append(local)
+    return out
+
+
+def himawari_bt(files, area):
+    from satpy import Scene
+    scn = Scene(reader="ahi_hsd", filenames=files)
+    scn.load(["B13"])
+    res = scn.resample(area, resampler="bilinear", radius_of_influence=15000)
+    return np.asarray(res["B13"].values, float)
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Meteosat IODC (EUMETSAT Data Store)
+# ---------------------------------------------------------------------------
+IODC_COLLECTION = "EO:EUM:DAT:MSG:HRSEVIRI-IODC"
+
+
+def meteosat_products(times):
+    import eumdac
+    key, secret = os.environ.get("EUMETSAT_KEY"), os.environ.get("EUMETSAT_SECRET")
+    if not (key and secret):
+        sys.exit("Set EUMETSAT_KEY and EUMETSAT_SECRET for --source meteosat")
+    store = eumdac.DataStore(eumdac.AccessToken((key, secret)))
+    coll = store.get_collection(IODC_COLLECTION)
+    prods = list(coll.search(dtstart=times[0] - dt.timedelta(minutes=10),
+                             dtend=times[-1] + dt.timedelta(minutes=20)))
+    if not prods:
+        sys.exit("No Meteosat IODC products for that day - try --source himawari")
+    starts = [p.sensing_start.replace(tzinfo=dt.timezone.utc) for p in prods]
+    chosen = []
+    for t in times:
+        i = int(np.argmin([abs((s - t).total_seconds()) for s in starts]))
+        chosen.append(prods[i] if abs((starts[i] - t).total_seconds()) < 900 else None)
+    return chosen
+
+
+def meteosat_fetch(product, cache):
+    if product is None:
+        return None
+    nat = [e for e in product.entries if e.endswith(".nat")]
+    if not nat:
+        return None
+    local = os.path.join(cache, os.path.basename(nat[0]))
+    if not os.path.exists(local):
+        with product.open(entry=nat[0]) as src, open(local + ".part", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.replace(local + ".part", local)
+    return [local]
+
+
+def meteosat_bt(files, area):
+    from satpy import Scene
+    scn = Scene(reader="seviri_l1b_native", filenames=files)
+    scn.load(["IR_108"])
+    res = scn.resample(area, resampler="bilinear", radius_of_influence=10000)
+    return np.asarray(res["IR_108"].values, float)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic demo field (only for testing the renderer without downloads)
+# ---------------------------------------------------------------------------
+def _spectral_noise(shape, beta, rng):
+    """Smooth random field with power spectrum ~ k^-beta over all axes."""
+    f = np.fft.fftn(rng.normal(size=shape))
+    k = np.sqrt(sum(np.meshgrid(*[np.fft.fftfreq(n) ** 2 for n in shape],
+                                indexing="ij")))
+    k[(0,) * len(shape)] = 1
+    out = np.real(np.fft.ifftn(f * k ** (-beta / 2)))
+    return (out - out.mean()) / out.std()
+
+
+def demo_bt_series(times, seed=3):
+    rng = np.random.default_rng(seed)
+    lon, lat = grid_lonlat()
+    ny, nx = lon.shape
+    nt = len(times)
+    # evolving texture fields (time, y, x), generated at half resolution
+    tex = _spectral_noise((nt, ny // 2, nx // 2), 3.2, rng)
+    fine = _spectral_noise((nt, ny // 2, nx // 2), 2.2, rng)
+    tex = ndimage.zoom(tex, (1, 2, 2), order=1)[:, :ny, :nx]
+    fine = ndimage.zoom(fine, (1, 2, 2), order=1)[:, :ny, :nx]
+    # convective systems drifting west with a morning peak over the ocean
+    systems = []
+    for _ in range(14):
+        systems.append(dict(x=rng.uniform(LON_MIN, LON_MAX + 2),
+                            y=rng.uniform(LAT_MIN, LAT_MAX),
+                            u=rng.normal(-0.05, 0.02), v=rng.normal(0.0, 0.015),
+                            t0=rng.uniform(-0.3, 1.0) * nt,
+                            life=rng.uniform(0.3, 0.7) * nt,
+                            rx=rng.uniform(0.4, 1.4), ry=rng.uniform(0.3, 0.9),
+                            depth=rng.uniform(25, 62)))
+    out = []
+    for k in range(nt):
+        hours = k * 24 / nt
+        diurnal = 0.75 + 0.25 * np.cos(2 * np.pi * (hours - 6) / 24)
+        env = np.zeros_like(lon)
+        for s in systems:
+            age = (k - s["t0"]) / s["life"]
+            if not 0 <= age <= 1:
+                continue
+            a = np.sin(np.pi * age) ** 1.2
+            x, y = s["x"] + s["u"] * (k - s["t0"]), s["y"] + s["v"] * (k - s["t0"])
+            d = ((lon - x) / s["rx"]) ** 2 + ((lat - y) / s["ry"]) ** 2
+            env = np.maximum(env, a * s["depth"] * np.exp(-d * 1.6))
+        bt = 298.5 - 4 * np.clip(fine[k], 0, None)
+        bt -= 30 * np.clip(tex[k] + 0.05, 0, None) ** 1.4          # broken cloud field
+        cells = np.clip(0.6 + 0.35 * fine[k] + 0.25 * tex[k], 0.1, 1.0)
+        bt -= diurnal * env * cells                                  # towering cells
+        out.append(185 + (np.clip(bt, 150, 300) - 185) * (bt > 185) + 6 * np.tanh((bt - 185) / 6) * (bt <= 185))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 3-D rendering with PyVista
+# ---------------------------------------------------------------------------
+class Renderer:
+    def __init__(self, segs):
+        import pyvista as pv
+        self.pv = pv
+        pv.OFF_SCREEN = True
+        lon, lat = grid_lonlat()
+        self.lon, self.lat = lon, lat
+        self.p = pv.Plotter(off_screen=True, window_size=(WIDTH, HEIGHT),
+                            lighting="none")
+        self.p.set_background(SEA_RGB / 255 * 0.8)
+        self.p.enable_anti_aliasing("msaa", multi_samples=8)
+
+        # cloud / sea surface (one mesh, heights updated per frame)
+        self.actor = None
+
+        # coastlines: thin white lines just above the sea
+        pts, lines, off = [], [], 0
+        for s in segs:
+            n = len(s)
+            pts.append(np.c_[s, np.full(n, 0.012)])
+            lines.append(np.r_[n, np.arange(off, off + n)])
+            off += n
+        coast = pv.PolyData(np.vstack(pts), lines=np.hstack(lines))
+        self.p.add_mesh(coast, color="white", line_width=2.2, opacity=0.95)
+
+        # light from the north-west, high, like a late-afternoon sun
+        self.p.add_light(pv.Light(position=(-1.0, 1.2, 1.6), focal_point=(0, 0, 0),
+                                  light_type="scene light", intensity=1.0))
+        self.p.add_light(pv.Light(position=(1, -1, 0.6), light_type="scene light",
+                                  intensity=0.25))
+        self.p.camera.SetViewAngle(30)
+
+    def set_camera(self, k, n):
+        """Viewed from the south, tilted ~55°, with a slow swing across the day."""
+        cx, cy = 73.6, 3.0
+        swing = np.sin(2 * np.pi * k / n)
+        dist, elev = 17.5, np.radians(47 + 3 * np.cos(2 * np.pi * k / n))
+        self.cam_pos = np.array([cx - 1.0 * swing, cy - dist * np.cos(elev),
+                                 dist * np.sin(elev)])
+        self.p.camera_position = [tuple(self.cam_pos), (cx, cy, 0.0), (0, 0, 1)]
+
+    def project(self, pts):
+        """World -> pixel coordinates (top-left origin) for the current view."""
+        import vtk
+        c = vtk.vtkCoordinate()
+        c.SetCoordinateSystemToWorld()
+        out = []
+        for p_ in pts:
+            c.SetValue(*p_)
+            x, y = c.GetComputedDoubleDisplayValue(self.p.renderer)
+            out.append((x, HEIGHT - y))
+        return out
+
+    def occluded(self, lon0, lat0, z_surface):
+        """True if the cloud surface blocks the line of sight to (lon0, lat0)."""
+        p0 = np.array([lon0, lat0, 0.02])
+        ts = np.linspace(0.002, 0.35, 120)
+        ray = p0 + ts[:, None] * (self.cam_pos - p0)
+        col = (ray[:, 0] - (LON_MIN + RES / 2)) / RES
+        row = ((LAT_MAX - RES / 2) - ray[:, 1]) / RES
+        zs = ndimage.map_coordinates(z_surface, [row, col], order=1, cval=0.0)
+        return bool(np.any(zs > ray[:, 2]))
+
+    def frame(self, bt, k, n):
+        bt = ndimage.gaussian_filter(np.nan_to_num(bt, nan=T_SURF), 1.1)
+        z = bt_to_height_km(bt) * Z_SCALE
+        grid = self.pv.StructuredGrid(self.lon, self.lat, z)
+        grid["rgb"] = bt_to_rgb(bt).reshape(-1, 3, order="F")
+        surf = grid.extract_surface(algorithm="dataset_surface").compute_normals(cell_normals=False,
+                                                      split_vertices=False)
+        if self.actor is not None:
+            self.p.remove_actor(self.actor)
+        self.actor = self.p.add_mesh(surf, scalars="rgb", rgb=True,
+                                     smooth_shading=True, ambient=0.28,
+                                     diffuse=0.85, specular=0.12,
+                                     specular_power=18, show_scalar_bar=False)
+        self.set_camera(k, n)
+        self.p.render()
+        img = np.asarray(self.p.screenshot(return_img=True))
+        places = [(nm, la, lo, "city") for nm, la, lo in CITIES] + \
+                 [(nm, la, lo, "atoll") for nm, la, lo in ATOLLS]
+        xy = self.project([(lo, la, 0.02) for _, la, lo, _ in places])
+        labels = [(nm, x, y, kind) for (nm, la, lo, kind), (x, y) in zip(places, xy)
+                  if not self.occluded(lo, la, z)]
+        return img, labels
+
+
+# ---------------------------------------------------------------------------
+# 2-D overlay (title, time, legend, credits)
+# ---------------------------------------------------------------------------
+def _font(size, bold=False, mono=False):
+    names = (["DejaVuSansMono-Bold.ttf", "DejaVuSansMono.ttf"] if mono else
+             ["DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"])
+    for nm in names:
+        for d in ("/usr/share/fonts/truetype/dejavu", "/Library/Fonts",
+                  "C:/Windows/Fonts", ""):
+            try:
+                return ImageFont.truetype(os.path.join(d, nm), size)
+            except OSError:
+                pass
+    return ImageFont.load_default()
+
+
+def overlay(img, labels, t_utc, k, n, bt, credit, demo):
+    im = Image.fromarray(img).convert("RGBA")
+    W, H = im.size
+    layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    # city labels (only those not hidden behind a cloud)
+    f_city, f_atoll = _font(17, True), _font(12)
+    for name, x, y, kind in labels:
+        if kind == "atoll":
+            if 0 < x < W and 150 < y < H - 130:
+                d.text((x - 10, y), name, font=f_atoll, fill=(150, 225, 220, 200),
+                       anchor="rm", stroke_width=2, stroke_fill=(10, 14, 22, 150))
+            continue
+        if 0 < x < W and 150 < y < H - 130:
+            d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(255, 255, 255, 255),
+                      outline=(0, 0, 0, 160))
+            d.text((x + 9, y), name, font=f_city, fill=(255, 255, 255, 255),
+                   anchor="lm", stroke_width=2, stroke_fill=(10, 14, 22, 200))
+
+    # top gradient for legibility
+    for y in range(170):
+        d.line([(0, y), (W, y)], fill=(12, 16, 24, int(200 * (1 - y / 170))))
+    t_loc = t_utc.astimezone(MVT)
+    d.text((28, 22), "MALDIVES  ·  3D SATELLITE CLOUDS", font=_font(26, True),
+           fill=(255, 255, 255, 255))
+    d.text((28, 60), f"{t_loc:%d %b %Y   %H:%M} MVT", font=_font(30, mono=True),
+           fill=(255, 214, 64, 255))
+    d.text((30, 100), f"{t_utc:%H:%M} UTC   ·   IR 10.4 µm cloud-top temperature",
+           font=_font(16), fill=(200, 208, 222, 230))
+    # day progress
+    d.rounded_rectangle([28, 132, W - 28, 136], 2, fill=(255, 255, 255, 50))
+    d.rounded_rectangle([28, 132, 28 + (W - 56) * (k + 1) / n, 136], 2,
+                        fill=(255, 214, 64, 230))
+
+    # deep-convection readout
+    deep = np.mean(np.nan_to_num(bt, nan=300) < 220) * 100
+    d.text((W - 28, 100), f"deep convection {deep:4.1f}%", font=_font(16, True),
+           fill=(255, 120, 90, 255) if deep > 1 else (200, 208, 222, 200),
+           anchor="ra")
+
+    # legend bar at bottom
+    for y in range(H - 120, H):
+        d.line([(0, y), (W, y)], fill=(12, 16, 24, int(210 * (y - H + 120) / 120)))
+    x0, x1, yb = 120, W - 120, H - 70
+    temps = np.linspace(290, 185, x1 - x0)
+    cols = bt_to_rgb(temps)
+    for i, c in enumerate(cols):
+        d.line([(x0 + i, yb), (x0 + i, yb + 12)], fill=tuple(int(v) for v in c) + (255,))
+    d.rectangle([x0, yb, x1, yb + 12], outline=(255, 255, 255, 120))
+    for tk, lbl in [(280, "low"), (250, "mid"), (230, "−43°C"),
+                    (210, "−63°C"), (190, "−83°C")]:
+        xi = x0 + (290 - tk) / 105 * (x1 - x0)
+        d.text((xi, yb + 18), lbl, font=_font(13), fill=(220, 226, 236, 230), anchor="ma")
+    d.text((W / 2, yb - 26), "cloud-top temperature  —  red = intense thunderstorms",
+           font=_font(15), fill=(220, 226, 236, 230), anchor="ma")
+    d.text((W - 14, H - 14), credit, font=_font(11), fill=(150, 160, 180, 200),
+           anchor="rd")
+
+    if demo:
+        wm = Image.new("RGBA", im.size, (0, 0, 0, 0))
+        ImageDraw.Draw(wm).text((W / 2, H / 2), "SYNTHETIC DEMO DATA",
+                                font=_font(64, True), fill=(255, 255, 255, 55),
+                                anchor="mm")
+        layer = Image.alpha_composite(layer, wm.rotate(28, center=(W / 2, H / 2)))
+    return np.asarray(Image.alpha_composite(im, layer).convert("RGB"))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def load_series(args, times):
+    if args.demo:
+        return demo_bt_series(times), "Synthetic test field — NOT real observations"
+    area = target_area()
+    os.makedirs(args.cache, exist_ok=True)
+    if args.source == "himawari":
+        items, reader = times, himawari_bt
+        fetch = lambda t: himawari_fetch(t, args.cache)
+        credit = "Data: JMA Himawari-9 AHI B13 via NOAA Open Data (AWS)"
+    else:
+        items, reader = meteosat_products(times), meteosat_bt
+        fetch = lambda p: meteosat_fetch(p, args.cache)
+        credit = "Data: EUMETSAT Meteosat IODC SEVIRI IR 10.8"
+    print(f"Downloading {len(items)} timesteps ({args.source})...")
+    with ThreadPoolExecutor(args.workers) as pool:
+        files = list(pool.map(fetch, items))
+    bts = []
+    for t, f in zip(times, files):
+        if not f:
+            print(f"  {t:%H:%M} UTC missing"); bts.append(None); continue
+        try:
+            bts.append(reader(f, area)); print(f"  {t:%H:%M} UTC ok")
+        except Exception as e:
+            print(f"  {t:%H:%M} UTC failed: {e}"); bts.append(None)
+    return bts, credit + "  ·  heights estimated from IR temperature"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    yesterday = (dt.datetime.now(MVT) - dt.timedelta(days=1)).date()
+    ap.add_argument("--date", type=dt.date.fromisoformat, default=yesterday,
+                    help="Maldives local date YYYY-MM-DD (default: yesterday)")
+    ap.add_argument("--source", choices=["himawari", "meteosat"], default="himawari")
+    ap.add_argument("--step", type=int, default=20, help="minutes between frames")
+    ap.add_argument("--fps", type=float, default=10)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--cache", default="sat_cache")
+    ap.add_argument("--out", default=None, help="output .gif path")
+    ap.add_argument("--no-mp4", action="store_true")
+    ap.add_argument("--gif-width", type=int, default=560,
+                    help="GIF width in px (MP4 keeps full size)")
+    ap.add_argument("--demo", action="store_true")
+    args = ap.parse_args()
+
+    times = frame_times(args.date, args.step)
+    out = args.out or f"maldives_clouds_3d_{args.date}{'_demo' if args.demo else ''}.gif"
+
+    bts, credit = load_series(args, times)
+    pairs = [(t, b) for t, b in zip(times, bts) if b is not None]
+    if not pairs:
+        sys.exit("No usable imagery.")
+
+    r = Renderer(coastlines())
+    frames = []
+    for k, (t, bt) in enumerate(pairs):
+        img, labels = r.frame(bt, k, len(pairs))
+        frames.append(overlay(img, labels, t, k, len(pairs), bt, credit, args.demo))
+        print(f"  rendered {k + 1}/{len(pairs)}", end="\r")
+    print()
+
+    import imageio.v2 as imageio
+    if not args.no_mp4:
+        mp4 = os.path.splitext(out)[0] + ".mp4"
+        imageio.mimsave(mp4, frames, fps=args.fps, codec="libx264", quality=8,
+                        macro_block_size=8)
+        print("Saved", mp4)
+    gh = int(HEIGHT * args.gif_width / WIDTH)
+    small = [Image.fromarray(f).resize((args.gif_width, gh), Image.LANCZOS)
+             for f in frames]
+    # Shared palette built from many frames + the full colour scale, so the
+    # enhanced-IR rainbow survives the 256-colour GIF limit.
+    idx = np.linspace(0, len(small) - 1, min(10, len(small))).astype(int)
+    ramp = bt_to_rgb(np.linspace(300, 175, args.gif_width))
+    ramp_img = Image.fromarray(np.repeat(ramp[None], 40, 0))
+    sample = Image.new("RGB", (args.gif_width, gh * len(idx) + 40 * 4))
+    for j, i in enumerate(idx):
+        sample.paste(small[i], (0, j * gh))
+    for j in range(4):                       # weight the ramp so it gets entries
+        sample.paste(ramp_img, (0, gh * len(idx) + 40 * j))
+    pal = sample.quantize(256, method=Image.Quantize.MAXCOVERAGE)
+    gif = [im.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG) for im in small]
+    durs = [int(1000 / args.fps)] * (len(gif) - 1) + [1200]
+    gif[0].save(out, save_all=True, append_images=gif[1:], duration=durs,
+                loop=0, optimize=False)
+    print("Saved", out)
+
+
+if __name__ == "__main__":
+    main()
