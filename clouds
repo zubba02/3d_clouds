@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maldives_clouds_3d.py  —  3-D satellite cloud animation over the 
+clouds_3d.py  —  3-D satellite cloud animation over the 
 ==========================================================================
 Downloads one local day of geostationary infrared (IR) imagery and renders a
 lit, perspective 3-D "cloud-top terrain" animation:
