@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maldives_clouds_3d.py  —  3-D satellite cloud animation over the Maldives
+clouds_3d.py  —  3-D satellite cloud animation over the 
 ==========================================================================
 Downloads one local day of geostationary infrared (IR) imagery and renders a
 lit, perspective 3-D "cloud-top terrain" animation:
@@ -11,13 +11,13 @@ lit, perspective 3-D "cloud-top terrain" animation:
     an enhanced-IR rainbow (blue > cyan > green > yellow > orange > red), so
     big thunderstorm complexes glow red
   * dark sea, thin white GSHHS full-resolution coastlines (every island the
-    dataset holds), and city labels for the main Maldives towns
+    dataset holds), and city labels for the main islabds
   * output: animated GIF (and MP4)
 
 Data sources
 ------------
   himawari  (default, no account)  Himawari-9 AHI band 13 (10.4 µm), NOAA Open
-            Data bucket on AWS. The Maldives sits near the western edge of the
+            Data bucket on AWS. The region sits near the western edge of the
             disk, so pixels are ~5-6 km; still good for convective systems.
   meteosat  Meteosat IODC SEVIRI IR_108 from the EUMETSAT Data Store. Better
             viewing angle; needs a free API key in EUMETSAT_KEY/EUMETSAT_SECRET
@@ -34,10 +34,10 @@ Install
 
 Usage
 -----
-  python maldives_clouds_3d.py                         # yesterday, Himawari
-  python maldives_clouds_3d.py --date 2026-10-25 --step 10
-  python maldives_clouds_3d.py --source meteosat
-  python maldives_clouds_3d.py --demo                  # synthetic, no download
+  python clouds_3d.py                         # yesterday, Himawari
+  python clouds_3d.py --date 2026-10-25 --step 10
+  python clouds_3d.py --source meteosat
+  python clouds_3d.py --demo                  # synthetic, no download
 """
 
 import argparse
@@ -62,7 +62,7 @@ np.seterr(all="ignore")
 # ---------------------------------------------------------------------------
 # Domain / look
 # ---------------------------------------------------------------------------
-LON_MIN, LON_MAX = 67.0, 84.0     # Maldives to Sri Lanka, with room to orbit
+LON_MIN, LON_MAX = 67.0, 84.0     # North Central IO with room to orbit
 LAT_MIN, LAT_MAX = -5.0, 12.5
 RES = 0.03                     # deg (~3.3 km) render grid
 MVT = dt.timezone(dt.timedelta(hours=5))
