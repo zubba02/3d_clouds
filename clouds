@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-clouds_3d.py  —  3-D satellite cloud animation over the 
+maldives_clouds_3d.py  —  3-D satellite cloud animation over the 
 ==========================================================================
 Downloads one local day of geostationary infrared (IR) imagery and renders a
 lit, perspective 3-D "cloud-top terrain" animation:
@@ -11,7 +11,7 @@ lit, perspective 3-D "cloud-top terrain" animation:
     an enhanced-IR rainbow (blue > cyan > green > yellow > orange > red), so
     big thunderstorm complexes glow red
   * dark sea, thin white GSHHS full-resolution coastlines (every island the
-    dataset holds), and city labels for the main islabds
+    dataset holds), and city labels for the main islands
   * output: animated GIF (and MP4)
 
 Data sources
@@ -62,7 +62,7 @@ np.seterr(all="ignore")
 # ---------------------------------------------------------------------------
 # Domain / look
 # ---------------------------------------------------------------------------
-LON_MIN, LON_MAX = 67.0, 84.0     # North Central IO with room to orbit
+LON_MIN, LON_MAX = 67.0, 84.0     # Sri Lanka, with room to orbit
 LAT_MIN, LAT_MAX = -5.0, 12.5
 RES = 0.03                     # deg (~3.3 km) render grid
 MVT = dt.timezone(dt.timedelta(hours=5))
@@ -75,12 +75,6 @@ CAM_CENTER = (77.0, 4.4)       # point the camera orbits around (lon, lat)
 
 SEA_RGB = np.array([27, 35, 48])          # dark slate-navy, like the reference
 CITIES = [                                 # (name, lat, lon)
-    ("Malé", 4.175, 73.509),
-    ("Kulhudhuffushi", 6.622, 73.070),
-    ("Fonadhoo", 1.833, 73.502),
-    ("Thinadhoo", 0.530, 72.996),
-    ("Fuvahmulah", -0.299, 73.424),
-    ("Addu City", -0.629, 73.158),
     ("Minicoy", 8.283, 73.049),
     ("Thiruvananthapuram", 8.524, 76.936),
     ("Kochi", 9.931, 76.267),
@@ -91,14 +85,31 @@ CITIES = [                                 # (name, lat, lon)
     ("Trincomalee", 8.587, 81.215),
 ]
 
-ATOLLS = [                                 # subtle labels for the atolls
-    ("Haa Alifu", 6.95, 72.95), ("Haa Dhaalu", 6.60, 73.05),
-    ("Shaviyani", 6.25, 73.20), ("Noonu", 5.85, 73.35), ("Raa", 5.60, 72.95),
-    ("Lhaviyani", 5.35, 73.55), ("Baa", 5.15, 73.00), ("Kaafu", 4.45, 73.45),
-    ("Alifu Alifu", 4.10, 72.85), ("Alifu Dhaalu", 3.62, 72.80),
-    ("Vaavu", 3.45, 73.50), ("Faafu", 3.18, 72.95), ("Meemu", 2.95, 73.55),
-    ("Dhaalu", 2.85, 72.92), ("Thaa", 2.35, 73.08), ("Laamu", 1.90, 73.40),
-    ("Gaafu Alifu", 0.75, 73.35), ("Gaafu Dhaalu", 0.35, 73.10),
+MALE = (4.175, 73.509)                      # national capital
+
+# Administrative atolls: name, approx. centre (lat, lon), capital island and
+# its approx. position. Centres are only used to assign islands to atolls.
+ATOLLS = [
+    ("Haa Alifu",    6.90, 73.00, "Dhidhdhoo",      6.887, 73.114),
+    ("Haa Dhaalu",   6.55, 73.05, "Kulhudhuffushi", 6.622, 73.070),
+    ("Shaviyani",    6.20, 73.25, "Funadhoo",       6.150, 73.290),
+    ("Noonu",        5.85, 73.32, "Manadhoo",       5.767, 73.411),
+    ("Raa",          5.55, 72.98, "Ungoofaaru",     5.668, 73.030),
+    ("Baa",          5.10, 73.05, "Eydhafushi",     5.103, 73.070),
+    ("Lhaviyani",    5.32, 73.50, "Naifaru",        5.444, 73.366),
+    ("Kaafu",        4.20, 73.45, "Thulusdhoo",     4.374, 73.650),
+    ("Alifu Alifu",  4.10, 72.90, "Rasdhoo",        4.263, 72.992),
+    ("Alifu Dhaalu", 3.68, 72.85, "Mahibadhoo",     3.757, 72.969),
+    ("Vaavu",        3.35, 73.55, "Felidhoo",       3.472, 73.547),
+    ("Meemu",        2.95, 73.55, "Muli",           2.917, 73.578),
+    ("Faafu",        3.12, 72.95, "Nilandhoo",      3.057, 72.890),
+    ("Dhaalu",       2.78, 72.92, "Kudahuvadhoo",   2.671, 72.894),
+    ("Thaa",         2.32, 73.10, "Veymandoo",      2.188, 73.095),
+    ("Laamu",        1.92, 73.40, "Fonadhoo",       1.833, 73.502),
+    ("Gaafu Alifu",  0.70, 73.32, "Viligili",       0.757, 73.435),
+    ("Gaafu Dhaalu", 0.35, 73.12, "Thinadhoo",      0.530, 72.996),
+    ("Gnaviyani",   -0.30, 73.43, "Fuvahmulah",    -0.299, 73.424),
+    ("Seenu",       -0.63, 73.15, "Hithadhoo (Addu City)", -0.615, 73.088),
 ]
 
 # Enhanced-IR palette: (BT kelvin, RGB). Warm end blends sea -> grey -> white,
@@ -212,6 +223,55 @@ def coastlines(cache=f"coast_cache_{LON_MIN}_{LON_MAX}_{LAT_MIN}_{LAT_MAX}.npz")
     np.savez(cache, segs=np.array(segs, dtype=object))
     print(f"  {len(segs)} coastline segments")
     return segs
+
+
+def atoll_outlines(segs, gap=0.12, pad=0.022):
+    """Rim outlines for each atoll, built from the island coastlines.
+
+    Islands are assigned to the nearest administrative-atoll centre, split into
+    natural sub-atolls (islands closer than `gap` degrees chain together), and
+    each group gets a padded, smoothed convex hull - a good stand-in for the
+    reef rim. Returns a list of (atoll_index, Nx2 lon/lat array).
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial import ConvexHull
+    isl = [s for s in segs
+           if 72.3 < s[:, 0].mean() < 74.0 and -1.0 < s[:, 1].mean() < 7.3]
+    if not isl:
+        return []
+    cent = np.array([s.mean(0) for s in isl])
+    ctr = np.array([[lo, la] for _, la, lo, *_ in ATOLLS])
+    owner = np.argmin(((cent[:, None] - ctr[None]) ** 2).sum(-1), 1)
+
+    def chaikin(p, n=3):                    # corner-cutting smoothing
+        for _ in range(n):
+            q = np.roll(p, -1, 0)
+            p = np.stack([0.75 * p + 0.25 * q, 0.25 * p + 0.75 * q], 1).reshape(-1, 2)
+        return p
+
+    out = []
+    for a in range(len(ATOLLS)):
+        idx = np.flatnonzero(owner == a)
+        if len(idx) == 0:
+            continue
+        sub = (fcluster(linkage(cent[idx], "single"), gap, "distance")
+               if len(idx) > 1 else np.array([1]))
+        for c in np.unique(sub):
+            pts = np.vstack([isl[i] for i in idx[sub == c]])
+            mid = pts.mean(0)
+            try:
+                hull = pts[ConvexHull(pts).vertices]
+            except Exception:                # too few / collinear points
+                hull = pts
+            v = hull - mid
+            r = np.hypot(v[:, 0], v[:, 1])[:, None]
+            hull = mid + v * (r + pad) / np.maximum(r, 1e-9)
+            if len(hull) < 3:                # single tiny island -> small circle
+                t = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+                hull = mid + pad * np.c_[np.cos(t), np.sin(t)]
+            ring = chaikin(hull)
+            out.append((a, np.vstack([ring, ring[:1]])))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +417,7 @@ def demo_bt_series(times, seed=3):
 class Renderer:
     def __init__(self, segs, elev=62, orbit=32, dist=27):
         self.elev, self.orbit, self.dist = elev, orbit, dist
+        self.outlines = atoll_outlines(segs)
         import pyvista as pv
         self.pv = pv
         pv.OFF_SCREEN = True
@@ -441,12 +502,22 @@ class Renderer:
         self.set_camera(k, n)
         self.p.render()
         img = np.asarray(self.p.screenshot(return_img=True))
-        places = [(nm, la, lo, "city") for nm, la, lo in CITIES] + \
-                 [(nm, la, lo, "atoll") for nm, la, lo in ATOLLS]
-        xy = self.project([(lo, la, 0.02) for _, la, lo, _ in places])
-        labels = [(nm, x, y, kind) for (nm, la, lo, kind), (x, y) in zip(places, xy)
+        # other cities: hidden when a cloud is in front
+        xy = self.project([(lo, la, 0.02) for _, la, lo in CITIES])
+        labels = [(nm, x, y, "city") for (nm, la, lo), (x, y) in zip(CITIES, xy)
                   if not self.occluded(lo, la, z)]
-        return img, labels
+        # Maldives: atoll outlines, capitals and Malé are ALWAYS shown (on top)
+        rings = []
+        for a, ring in self.outlines:
+            sxy = np.array(self.project([(lo, la, 0.0) for lo, la in ring]))
+            rings.append((a, sxy))
+        caps = self.project([(c[5], c[4], 0.0) for c in ATOLLS] +
+                            [(MALE[1], MALE[0], 0.0)])
+        labels.append(("Malé", *caps[-1], "male"))
+        for i, c in enumerate(ATOLLS):
+            east = max((r[:, 0].max() for a, r in rings if a == i), default=caps[i][0])
+            labels.append(((c[0], c[3]), caps[i][0], caps[i][1], "capital", east))
+        return img, labels, rings
 
 
 # ---------------------------------------------------------------------------
@@ -482,25 +553,61 @@ def _font(size, bold=False, mono=False):
     return f
 
 
-def overlay(img, labels, t_utc, k, n, bt, credit, demo):
+def overlay(img, labels, rings, t_utc, k, n, bt, credit, demo):
     im = Image.fromarray(img).convert("RGBA")
     W, H = im.size
     layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
 
-    # city labels (only those not hidden behind a cloud)
-    f_city, f_atoll = _font(17, True), _font(12)
-    for name, x, y, kind in labels:
-        if kind == "atoll":
-            if 0 < x < W and 150 < y < H - 130:
-                d.text((x - 10, y), name, font=f_atoll, fill=(150, 225, 220, 200),
-                       anchor="rm", stroke_width=2, stroke_fill=(10, 14, 22, 150))
+    # atoll rim outlines - drawn over the clouds so they're always visible
+    for _, r in rings:
+        pts = [tuple(p) for p in r]
+        d.line(pts, fill=(5, 20, 30, 150), width=4, joint="curve")      # dark halo
+        d.line(pts, fill=(110, 240, 225, 235), width=2, joint="curve")  # bright rim
+
+    f_city, f_cap, f_atoll = _font(17, True), _font(13, True), _font(13)
+    # Atoll + capital labels in one tidy column east of the archipelago, with
+    # leader lines to each capital (Malé gets its own gold row).
+    rows = [(l[0], l[1], l[2], False) for l in labels if l[3] == "capital"]
+    male = [l for l in labels if l[3] == "male"]
+    if male:
+        rows.append(((None, "Malé"), male[0][1], male[0][2], True))
+    rows = [r_ for r_ in rows if 0 < r_[1] < W and 150 < r_[2] < H - 130]
+    if rows:
+        ring_east = max([r[:, 0].max() for _, r in rings] or [0])
+        col_x = min(max(ring_east, max(r_[1] for r_ in rows)) + 28, W - 260)
+        rows.sort(key=lambda r_: r_[2])
+        ys, last = [], -1e9
+        for r_ in rows:                       # push rows apart (min 16 px)
+            last = max(r_[2], last + 16)
+            ys.append(last)
+        shift = max(0, ys[-1] - (H - 140))    # keep the column on screen
+        ys = [y_ - shift for y_ in ys]
+        for ((atoll, capital), x, y, is_male), ly in zip(rows, ys):
+            d.line([(x, y), (col_x - 14, ly), (col_x - 4, ly)],
+                   fill=(255, 255, 255, 90), width=1)
+            if is_male:
+                d.regular_polygon((x, y, 7), 4, rotation=45, fill=(255, 214, 64, 255),
+                                  outline=(0, 0, 0, 200))
+                d.text((col_x, ly), "MALÉ  (capital)", font=_font(15, True),
+                       fill=(255, 214, 64, 255), anchor="lm",
+                       stroke_width=2, stroke_fill=(5, 15, 25, 230))
+                continue
+            d.ellipse([x - 3.5, y - 3.5, x + 3.5, y + 3.5], fill=(255, 255, 255, 255),
+                      outline=(0, 40, 50, 220))
+            w_atoll = d.textlength(atoll + "  ", font=f_atoll)
+            d.text((col_x, ly), atoll + "  ", font=f_atoll, fill=(130, 240, 228, 255),
+                   anchor="lm", stroke_width=2, stroke_fill=(5, 15, 25, 220))
+            d.text((col_x + w_atoll, ly), capital, font=f_cap, fill=(255, 255, 255, 255),
+                   anchor="lm", stroke_width=2, stroke_fill=(5, 15, 25, 220))
+
+    for name, x, y, kind, *_ in labels:
+        if kind != "city" or not (0 < x < W and 150 < y < H - 130):
             continue
-        if 0 < x < W and 150 < y < H - 130:
-            d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(255, 255, 255, 255),
-                      outline=(0, 0, 0, 160))
-            d.text((x + 9, y), name, font=f_city, fill=(255, 255, 255, 255),
-                   anchor="lm", stroke_width=2, stroke_fill=(10, 14, 22, 200))
+        d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(255, 255, 255, 255),
+                  outline=(0, 0, 0, 160))
+        d.text((x + 9, y), name, font=f_city, fill=(255, 255, 255, 255),
+               anchor="lm", stroke_width=2, stroke_fill=(10, 14, 22, 200))
 
     # top gradient for legibility
     for y in range(170):
@@ -626,8 +733,8 @@ def main():
     r = Renderer(coastlines(), elev=args.elev, orbit=args.orbit, dist=27 / args.zoom)
     frames = []
     for k, (t, bt) in enumerate(pairs):
-        img, labels = r.frame(bt, k, len(pairs))
-        frames.append(overlay(img, labels, t, k, len(pairs), bt, credit, args.demo))
+        img, labels, rings = r.frame(bt, k, len(pairs))
+        frames.append(overlay(img, labels, rings, t, k, len(pairs), bt, credit, args.demo))
         print(f"  rendered {k + 1}/{len(pairs)}", end="\r")
     print()
 
